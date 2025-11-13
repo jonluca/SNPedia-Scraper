@@ -147,14 +147,28 @@ class SNPediaScraper:
         genotype_count = int(self.get_progress('genotype_count') or 0)
         return snp_count + genotype_count, self.total_snps + self.total_genos
 
-    def _fetch_page_content(self, page_title: str) -> Optional[str]:
-        """Fetch the wiki content for a given page title."""
+    def _fetch_batch_content(self, page_titles: list) -> dict:
+        """
+        Fetch wiki content for multiple page titles in a single API call.
+
+        Args:
+            page_titles: List of page titles to fetch
+
+        Returns:
+            Dictionary mapping page titles to their content (or None if not found)
+        """
+        if not page_titles:
+            return {}
+
+        # MediaWiki API accepts pipe-delimited titles
+        titles_param = '|'.join(page_titles)
+
         params_content = {
             'action': 'query',
             'prop': 'revisions',
             'rvprop': 'content',
             'format': 'json',
-            'titles': page_title
+            'titles': titles_param
         }
 
         content_response = requests.get(self.api_url, params=params_content, headers={
@@ -163,21 +177,44 @@ class SNPediaScraper:
 
         data_content = content_response.json()
 
-        if 'query' in data_content and 'pages' in data_content['query']:
-            page_id = list(data_content['query']['pages'].keys())[0]
-            if page_id == '-1':  # Page doesn't exist
-                return None
-            return data_content['query']['pages'][page_id]['revisions'][0]['*']
+        results = {}
 
-        raise Exception("Invalid response structure")
+        if 'query' in data_content and 'pages' in data_content['query']:
+            for page_id, page_data in data_content['query']['pages'].items():
+                if page_id == '-1':  # Page doesn't exist
+                    continue
+
+                title = page_data.get('title', '').replace(' ', '_')
+
+                if 'revisions' in page_data and len(page_data['revisions']) > 0:
+                    results[title] = page_data['revisions'][0]['*']
+                else:
+                    results[title] = None
+
+        return results
+
+    def _save_entries(self, table: str, id_column: str, entries: list):
+        """
+        Save multiple entries to the database in a single transaction.
+
+        Args:
+            table: Database table name
+            id_column: ID column name
+            entries: List of tuples (identifier, content)
+        """
+        if not entries:
+            return
+
+        timestamp = datetime.now()
+        with self.db_pool.transaction() as conn:
+            conn.executemany(
+                f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
+                [(identifier, content, timestamp) for identifier, content in entries]
+            )
 
     def _save_entry(self, table: str, id_column: str, identifier: str, content: str):
-        """Save an entry to the database."""
-        with self.db_pool.transaction() as conn:
-            conn.execute(
-                f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
-                (identifier, content, datetime.now())
-            )
+        """Save a single entry to the database."""
+        self._save_entries(table, id_column, [(identifier, content)])
 
     def _scrape_category(
         self,
@@ -188,10 +225,11 @@ class SNPediaScraper:
         continue_key: str,
         total_count: int,
         item_name: str,
-        exists_checker: Callable[[str], bool]
+        exists_checker: Callable[[str], bool],
+        batch_size: int = 50
     ) -> int:
         """
-        Generic method to scrape a category from SNPedia.
+        Generic method to scrape a category from SNPedia using batch fetching.
 
         Args:
             category: The category to scrape (e.g., 'Category:Is_a_snp')
@@ -202,6 +240,7 @@ class SNPediaScraper:
             total_count: Total expected count
             item_name: Display name for items (e.g., 'SNP')
             exists_checker: Function to check if item already exists
+            batch_size: Number of pages to fetch in a single API call (default: 50)
 
         Returns:
             Final count of items scraped
@@ -230,7 +269,25 @@ class SNPediaScraper:
                 r.raise_for_status()
                 data = r.json()
 
+                # Collect all page titles from this batch
+                all_identifiers = []
                 for page in data['query']['categorymembers']:
+                    identifier = page['title'].replace(' ', '_')
+                    all_identifiers.append(identifier)
+
+                # Filter out already scraped items
+                identifiers_to_fetch = [
+                    identifier for identifier in all_identifiers
+                    if not exists_checker(identifier)
+                ]
+
+                # Skip already scraped items
+                skipped_count = len(all_identifiers) - len(identifiers_to_fetch)
+                if skipped_count > 0 and self.log_callback:
+                    self.log_callback(f"Skipping {skipped_count} already scraped {item_name}s")
+
+                # Process in batches
+                for i in range(0, len(identifiers_to_fetch), batch_size):
                     if not self.running:
                         break
 
@@ -239,51 +296,56 @@ class SNPediaScraper:
                             break
                         time.sleep(1)
 
-                    identifier = page['title'].replace(' ', '_')
-
-                    if exists_checker(identifier):
-                        if self.status_callback:
-                            self.status_callback(count, total_count, f"Skipped {identifier}")
-                        continue
+                    batch = identifiers_to_fetch[i:i + batch_size]
 
                     try:
-                        content = self._fetch_page_content(identifier)
+                        # Fetch content for all titles in this batch
+                        batch_results = self._fetch_batch_content(batch)
 
-                        if content is None:
-                            if self.log_callback:
-                                self.log_callback(f"Page not found for {identifier}. Skipping.")
-                            continue
+                        # Collect valid entries to save
+                        entries_to_save = []
+                        for identifier in batch:
+                            if identifier not in batch_results:
+                                if self.log_callback:
+                                    self.log_callback(f"Page not found for {identifier}. Skipping.")
+                                continue
 
-                        self._save_entry(table, id_column, identifier, content)
+                            content = batch_results[identifier]
+                            if content is None:
+                                if self.log_callback:
+                                    self.log_callback(f"No content for {identifier}. Skipping.")
+                                continue
 
-                        count += 1
-                        if self.status_callback:
-                            self.status_callback(count, total_count, identifier)
-                        if self.log_callback and count % 10 == 0:
-                            self.log_callback(f"Scraped {count} {item_name}s. Latest: {identifier}")
+                            entries_to_save.append((identifier, content))
 
-                        if count % 10 == 0:
+                        # Save all entries in a single transaction
+                        if entries_to_save:
+                            self._save_entries(table, id_column, entries_to_save)
+
+                            # Update progress for all saved items
+                            for identifier, _ in entries_to_save:
+                                count += 1
+                                if self.status_callback:
+                                    self.status_callback(count, total_count, identifier)
+
                             self.save_progress(count_key, str(count))
 
-                    except Exception as e:
-                        # Check if we actually saved this item despite the error
-                        if exists_checker(identifier):
                             if self.log_callback:
-                                self.log_callback(f"Got error but {identifier} was saved successfully. Continuing...")
-                            count += 1
-                            if self.status_callback:
-                                self.status_callback(count, total_count, identifier)
-                        else:
-                            # Real error - item wasn't saved
-                            if self.log_callback:
-                                self.log_callback(f"Error fetching {identifier}: {e}. Retrying in 30 seconds...")
+                                self.log_callback(f"Scraped batch of {len(entries_to_save)} {item_name}s. Total: {count}")
 
-                            error_type = "502_ERROR" if "502" in str(e) else "OTHER_ERROR"
+                    except Exception as e:
+                        # On error, fall back to individual fetching for this batch
+                        if self.log_callback:
+                            self.log_callback(f"Batch fetch error: {e}. Retrying individual items in 30 seconds...")
+
+                        error_type = "502_ERROR" if "502" in str(e) else "BATCH_ERROR"
+                        for identifier in batch:
                             self._log_error(identifier, error_type, str(e))
 
-                            time.sleep(30)
-                            continue
+                        time.sleep(30)
+                        continue
 
+                    # Rate limiting between batches
                     time.sleep(3)
 
                 if 'continue' in data and data['continue']:
@@ -294,7 +356,7 @@ class SNPediaScraper:
                         self.log_callback(f"Scraping complete: Reached end of {item_name} list.")
                     break
 
-                time.sleep(3)
+                time.sleep(2)
 
             except KeyboardInterrupt:
                 self.stop()
@@ -391,7 +453,7 @@ if __name__ == "__main__":
         sys.stdout.flush()
 
     print("=== SNPedia Scraper (CLI) ===")
-    print("This will take ~90 hours to complete.")
+    print("This will take a couple hours to complete.")
     print("Press Ctrl+C anytime to pause (progress is saved).")
     print("="*30)
 
