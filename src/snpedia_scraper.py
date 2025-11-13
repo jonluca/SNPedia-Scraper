@@ -7,7 +7,7 @@ import os
 import sys
 import threading
 from contextlib import contextmanager
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 # --- Path Setup ---
 # Get the absolute path to the project root directory
@@ -225,7 +225,6 @@ class SNPediaScraper:
         continue_key: str,
         total_count: int,
         item_name: str,
-        exists_checker: Callable[[str], bool],
         batch_size: int = 50
     ) -> int:
         """
@@ -239,7 +238,6 @@ class SNPediaScraper:
             continue_key: Progress key for continuation (e.g., 'cmcontinue_snp')
             total_count: Total expected count
             item_name: Display name for items (e.g., 'SNP')
-            exists_checker: Function to check if item already exists
             batch_size: Number of pages to fetch in a single API call (default: 50)
 
         Returns:
@@ -275,14 +273,17 @@ class SNPediaScraper:
                     identifier = page['title'].replace(' ', '_')
                     all_identifiers.append(identifier)
 
+                # Batch check which items already exist
+                existing_identifiers = self._batch_check_exists(table, id_column, all_identifiers)
+
                 # Filter out already scraped items
                 identifiers_to_fetch = [
                     identifier for identifier in all_identifiers
-                    if not exists_checker(identifier)
+                    if identifier not in existing_identifiers
                 ]
 
                 # Skip already scraped items
-                skipped_count = len(all_identifiers) - len(identifiers_to_fetch)
+                skipped_count = len(existing_identifiers)
                 if skipped_count > 0 and self.log_callback:
                     self.log_callback(f"Skipping {skipped_count} already scraped {item_name}s")
 
@@ -374,6 +375,19 @@ class SNPediaScraper:
         try:
             # Scrape SNPs
             if self.log_callback:
+                self.log_callback("Starting genotype scraping...")
+
+            self._scrape_category(
+                category='Category:Is_a_genotype',
+                table='genotypes',
+                id_column='id',
+                count_key='genotype_count',
+                continue_key='cmcontinue_genotype',
+                total_count=self.total_genos,
+                item_name='genotype'
+            )
+
+            if self.log_callback:
                 self.log_callback("Starting SNP scraping...")
 
             self._scrape_category(
@@ -383,25 +397,8 @@ class SNPediaScraper:
                 count_key='snp_count',
                 continue_key='cmcontinue_snp',
                 total_count=self.total_snps,
-                item_name='SNP',
-                exists_checker=self.already_scraped
+                item_name='SNP'
             )
-
-            # Scrape genotypes
-            if self.running:
-                if self.log_callback:
-                    self.log_callback("Starting genotype scraping...")
-
-                self._scrape_category(
-                    category='Category:Is_a_genotype',
-                    table='genotypes',
-                    id_column='id',
-                    count_key='genotype_count',
-                    continue_key='cmcontinue_genotype',
-                    total_count=self.total_genos,
-                    item_name='genotype',
-                    exists_checker=self.genotype_already_scraped
-                )
 
         finally:
             self.running = False
@@ -413,6 +410,32 @@ class SNPediaScraper:
         conn = self.db_pool.get_connection()
         cursor = conn.execute(f'SELECT 1 FROM {table} WHERE {id_column} = ?', (identifier,))
         return cursor.fetchone() is not None
+
+    def _batch_check_exists(self, table: str, id_column: str, identifiers: list) -> set:
+        """
+        Check which entries already exist in the database using a single query.
+
+        Args:
+            table: Database table name
+            id_column: ID column name
+            identifiers: List of identifiers to check
+
+        Returns:
+            Set of identifiers that already exist in the database
+        """
+        if not identifiers:
+            return set()
+
+        conn = self.db_pool.get_connection()
+
+        # Use placeholders for parameterized query
+        placeholders = ','.join('?' * len(identifiers))
+        query = f'SELECT {id_column} FROM {table} WHERE {id_column} IN ({placeholders})'
+
+        cursor = conn.execute(query, identifiers)
+        existing = {row[0] for row in cursor.fetchall()}
+
+        return existing
 
     def already_scraped(self, rsid: str) -> bool:
         """Check if a SNP has already been scraped."""
