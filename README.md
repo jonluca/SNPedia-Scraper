@@ -116,6 +116,11 @@ This will:
 - `content` (TEXT): Raw wiki content
 - `scraped_at` (TIMESTAMP): When the SNP was scraped
 
+### `genotypes` table
+- `id` (TEXT PRIMARY KEY): Genotype ID
+- `content` (TEXT): Raw wiki content
+- `scraped_at` (TIMESTAMP): When the SNP was scraped
+
 ### `progress` table
 - `key` (TEXT PRIMARY KEY): Progress key (cmcontinue, snp_count)
 - `value` (TEXT): Progress value for resumption
@@ -158,6 +163,7 @@ SNPedia-Scraper/
 
 ### Expected Data
 - ~110,000 total SNPs in SNPedia
+- ~105,000 total SNPs in SNPedia
 - Average content size: ~1KB per SNP
 - Small entries (<100 chars): Mostly 23andMe mappings
 
