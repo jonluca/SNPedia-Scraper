@@ -6,6 +6,8 @@ from datetime import datetime
 import os
 import sys
 import threading
+from contextlib import contextmanager
+from typing import Callable, Optional, Tuple
 
 # --- Path Setup ---
 # Get the absolute path to the project root directory
@@ -14,12 +16,48 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, 'snpedia.db')
 ERROR_LOG_PATH = os.path.join(PROJECT_ROOT, 'scraper_errors.log')
 
+
+class DatabaseConnectionPool:
+    """Manages a single persistent database connection throughout the scraper's lifetime."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._conn = None
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Get or create the persistent database connection."""
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        return self._conn
+
+    def close(self):
+        """Close the database connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    @contextmanager
+    def transaction(self):
+        """Context manager for database transactions."""
+        conn = self.get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 class SNPediaScraper:
     def __init__(self, db_path=DEFAULT_DB_PATH, status_callback=None, log_callback=None):
         self.db_path = db_path
         self.api_url = "https://bots.snpedia.com/api.php"
         self.total_snps = 110000  # From README
-        
+        self.total_genos = 104887  # From https://bots.snpedia.com/index.php/Category:Is_a_genotype
+
+        # Database connection pool
+        self.db_pool = DatabaseConnectionPool(db_path)
+
         # Callbacks for UI updates
         self.status_callback = status_callback
         self.log_callback = log_callback
@@ -49,22 +87,28 @@ class SNPediaScraper:
             f.flush()  # Ensure it's written immediately
 
     def _create_tables(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS snps (
-                rsid TEXT PRIMARY KEY,
-                content TEXT,
-                scraped_at TIMESTAMP
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS progress (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        """Create database tables if they don't exist."""
+        with self.db_pool.transaction() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS snps (
+                    rsid TEXT PRIMARY KEY,
+                    content TEXT,
+                    scraped_at TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS genotypes (
+                    id TEXT PRIMARY KEY,
+                    content TEXT,
+                    scraped_at TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS progress (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
 
     def start(self):
         if not self.running:
@@ -84,26 +128,97 @@ class SNPediaScraper:
 
     def stop(self):
         self.running = False
+        self.db_pool.close()
         if self.log_callback: self.log_callback("Scraper stopping...")
 
-    def get_current_progress(self):
+    def get_current_progress(self) -> Tuple[int, int]:
+        """Get current progress for SNPs."""
         count = int(self.get_progress('snp_count') or 0)
         return count, self.total_snps
 
-    def _scrape_loop(self):
+    def get_genotype_progress(self) -> Tuple[int, int]:
+        """Get current progress for genotypes."""
+        count = int(self.get_progress('genotype_count') or 0)
+        return count, self.total_genos
+
+    def get_combined_progress(self) -> Tuple[int, int]:
+        """Get combined progress for SNPs and genotypes."""
+        snp_count = int(self.get_progress('snp_count') or 0)
+        genotype_count = int(self.get_progress('genotype_count') or 0)
+        return snp_count + genotype_count, self.total_snps + self.total_genos
+
+    def _fetch_page_content(self, page_title: str) -> Optional[str]:
+        """Fetch the wiki content for a given page title."""
+        params_content = {
+            'action': 'query',
+            'prop': 'revisions',
+            'rvprop': 'content',
+            'format': 'json',
+            'titles': page_title
+        }
+
+        content_response = requests.get(self.api_url, params=params_content, headers={
+            'User-Agent': 'SNPediaScraper/1.0 (Educational Research; https://github.com/jaykobdetar/SNPedia-Scraper; simyc4982@email.com) Mozilla/5.0 compatible'
+        })
+
+        data_content = content_response.json()
+
+        if 'query' in data_content and 'pages' in data_content['query']:
+            page_id = list(data_content['query']['pages'].keys())[0]
+            if page_id == '-1':  # Page doesn't exist
+                return None
+            return data_content['query']['pages'][page_id]['revisions'][0]['*']
+
+        raise Exception("Invalid response structure")
+
+    def _save_entry(self, table: str, id_column: str, identifier: str, content: str):
+        """Save an entry to the database."""
+        with self.db_pool.transaction() as conn:
+            conn.execute(
+                f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
+                (identifier, content, datetime.now())
+            )
+
+    def _scrape_category(
+        self,
+        category: str,
+        table: str,
+        id_column: str,
+        count_key: str,
+        continue_key: str,
+        total_count: int,
+        item_name: str,
+        exists_checker: Callable[[str], bool]
+    ) -> int:
+        """
+        Generic method to scrape a category from SNPedia.
+
+        Args:
+            category: The category to scrape (e.g., 'Category:Is_a_snp')
+            table: Database table name (e.g., 'snps')
+            id_column: ID column name (e.g., 'rsid')
+            count_key: Progress key for count (e.g., 'snp_count')
+            continue_key: Progress key for continuation (e.g., 'cmcontinue_snp')
+            total_count: Total expected count
+            item_name: Display name for items (e.g., 'SNP')
+            exists_checker: Function to check if item already exists
+
+        Returns:
+            Final count of items scraped
+        """
         params = {
             'action': 'query',
             'list': 'categorymembers',
-            'cmtitle': 'Category:Is_a_snp',
+            'cmtitle': category,
             'cmlimit': 500,
             'format': 'json'
         }
 
-        last_continue = self.get_progress('cmcontinue')
+        last_continue = self.get_progress(continue_key)
         if last_continue:
             params['cmcontinue'] = last_continue
 
-        snp_count = int(self.get_progress('snp_count') or 0)
+        count = int(self.get_progress(count_key) or 0)
 
         while self.running:
             if self.paused:
@@ -118,102 +233,67 @@ class SNPediaScraper:
                 for page in data['query']['categorymembers']:
                     if not self.running:
                         break
-                    
+
                     while self.paused:
-                        if not self.running: break
+                        if not self.running:
+                            break
                         time.sleep(1)
 
-                    rsid = page['title']
-                    rsid = rsid.replace(' ', '_')  # Fix space-encoded rsids to avoid URL issues
-                    
-                    if self.already_scraped(rsid):
-                        if self.status_callback: self.status_callback(snp_count, self.total_snps, f"Skipped {rsid}")
+                    identifier = page['title'].replace(' ', '_')
+
+                    if exists_checker(identifier):
+                        if self.status_callback:
+                            self.status_callback(count, total_count, f"Skipped {identifier}")
                         continue
-                    
-                    # Try to fetch the content
+
                     try:
-                        # Use API for raw content - compliant and gets clean wiki markup
-                        params_content = {
-                            'action': 'query',
-                            'prop': 'revisions',
-                            'rvprop': 'content',
-                            'format': 'json',
-                            'titles': rsid
-                        }
-                        content_response = requests.get(self.api_url, params=params_content, headers={
-                            ''User-Agent': 'SNPediaScraper/1.0 (Educational Research; https://github.com/jaykobdetar/SNPedia-Scraper; simyc4982@email.com) Mozilla/5.0 compatible'
-                        })
-                        
-                        # Try to get JSON data even if status code indicates error
-                        try:
-                            data_content = content_response.json()
-                            
-                            # Check if we got valid data
-                            if 'query' in data_content and 'pages' in data_content['query']:
-                                page_id = list(data_content['query']['pages'].keys())[0]
-                                if page_id == '-1':  # Page doesn't exist
-                                    if self.log_callback: self.log_callback(f"Page not found for {rsid}. Skipping.")
-                                    continue
-                                    
-                                content = data_content['query']['pages'][page_id]['revisions'][0]['*']
-                                
-                                # Save the content
-                                conn = sqlite3.connect(self.db_path)
-                                conn.execute(
-                                    'INSERT INTO snps (rsid, content, scraped_at) VALUES (?, ?, ?)',
-                                    (rsid, content, datetime.now())
-                                )
-                                conn.commit()
-                                conn.close()
+                        content = self._fetch_page_content(identifier)
 
-                                snp_count += 1
-                                if self.status_callback: self.status_callback(snp_count, self.total_snps, rsid)
-                                if self.log_callback and snp_count % 10 == 0: self.log_callback(f"Scraped {snp_count} SNPs. Latest: {rsid}")
+                        if content is None:
+                            if self.log_callback:
+                                self.log_callback(f"Page not found for {identifier}. Skipping.")
+                            continue
 
-                                if snp_count % 10 == 0:
-                                    self.save_progress('snp_count', str(snp_count))
-                            else:
-                                # JSON is valid but doesn't contain expected data
-                                raise Exception("Invalid response structure")
-                                
-                        except (json.JSONDecodeError, KeyError) as e:
-                            # If we can't parse JSON or access expected keys, check status
-                            content_response.raise_for_status()
-                            raise e
+                        self._save_entry(table, id_column, identifier, content)
+
+                        count += 1
+                        if self.status_callback:
+                            self.status_callback(count, total_count, identifier)
+                        if self.log_callback and count % 10 == 0:
+                            self.log_callback(f"Scraped {count} {item_name}s. Latest: {identifier}")
+
+                        if count % 10 == 0:
+                            self.save_progress(count_key, str(count))
 
                     except Exception as e:
-                        # Check if we actually saved this SNP despite the error
-                        if self.already_scraped(rsid):
-                            if self.log_callback: 
-                                self.log_callback(f"Got error but {rsid} was saved successfully. Continuing...")
-                            snp_count += 1
-                            if self.status_callback: 
-                                self.status_callback(snp_count, self.total_snps, rsid)
-                            # No delay needed - it worked!
+                        # Check if we actually saved this item despite the error
+                        if exists_checker(identifier):
+                            if self.log_callback:
+                                self.log_callback(f"Got error but {identifier} was saved successfully. Continuing...")
+                            count += 1
+                            if self.status_callback:
+                                self.status_callback(count, total_count, identifier)
                         else:
-                            # Real error - SNP wasn't saved
-                            if self.log_callback: 
-                                self.log_callback(f"Error fetching {rsid}: {e}. Retrying in 30 seconds...")
-                            
-                            # Log the error for later recovery
-                            if "502" in str(e):
-                                self._log_error(rsid, "502_ERROR", str(e))
-                            else:
-                                self._log_error(rsid, "OTHER_ERROR", str(e))
-                            
+                            # Real error - item wasn't saved
+                            if self.log_callback:
+                                self.log_callback(f"Error fetching {identifier}: {e}. Retrying in 30 seconds...")
+
+                            error_type = "502_ERROR" if "502" in str(e) else "OTHER_ERROR"
+                            self._log_error(identifier, error_type, str(e))
+
                             time.sleep(30)
-                            continue  # Skip the normal delay and retry immediately
+                            continue
 
                     time.sleep(3)
 
                 if 'continue' in data and data['continue']:
                     params['cmcontinue'] = data['continue']['cmcontinue']
-                    self.save_progress('cmcontinue', params['cmcontinue'])
+                    self.save_progress(continue_key, params['cmcontinue'])
                 else:
-                    self.running = False # End of the list
-                    if self.log_callback: self.log_callback("Scraping complete: Reached end of SNP list.")
+                    if self.log_callback:
+                        self.log_callback(f"Scraping complete: Reached end of {item_name} list.")
                     break
-                
+
                 time.sleep(3)
 
             except KeyboardInterrupt:
@@ -221,33 +301,78 @@ class SNPediaScraper:
                 print("\n\nPausing... Progress saved. Run again to resume.")
                 break
             except Exception as e:
-                if self.log_callback: self.log_callback(f"Error: {e}. Retrying in 30 seconds...")
+                if self.log_callback:
+                    self.log_callback(f"Error: {e}. Retrying in 30 seconds...")
                 time.sleep(30)
-        
-        self.running = False
-        if self.log_callback: self.log_callback("Scraper stopped.")
 
-    def already_scraped(self, rsid):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute('SELECT 1 FROM snps WHERE rsid = ?', (rsid,))
-        exists = cursor.fetchone() is not None
-        conn.close()
-        return exists
+        return count
 
-    def save_progress(self, key, value):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            'INSERT OR REPLACE INTO progress (key, value) VALUES (?, ?)',
-            (key, str(value))
-        )
-        conn.commit()
-        conn.close()
+    def _scrape_loop(self):
+        """Main scraping loop that handles both SNPs and genotypes."""
+        try:
+            # Scrape SNPs
+            if self.log_callback:
+                self.log_callback("Starting SNP scraping...")
 
-    def get_progress(self, key):
-        conn = sqlite3.connect(self.db_path)
+            self._scrape_category(
+                category='Category:Is_a_snp',
+                table='snps',
+                id_column='rsid',
+                count_key='snp_count',
+                continue_key='cmcontinue_snp',
+                total_count=self.total_snps,
+                item_name='SNP',
+                exists_checker=self.already_scraped
+            )
+
+            # Scrape genotypes
+            if self.running:
+                if self.log_callback:
+                    self.log_callback("Starting genotype scraping...")
+
+                self._scrape_category(
+                    category='Category:Is_a_genotype',
+                    table='genotypes',
+                    id_column='id',
+                    count_key='genotype_count',
+                    continue_key='cmcontinue_genotype',
+                    total_count=self.total_genos,
+                    item_name='genotype',
+                    exists_checker=self.genotype_already_scraped
+                )
+
+        finally:
+            self.running = False
+            if self.log_callback:
+                self.log_callback("Scraper stopped.")
+
+    def _already_exists(self, table: str, id_column: str, identifier: str) -> bool:
+        """Check if an entry already exists in the database."""
+        conn = self.db_pool.get_connection()
+        cursor = conn.execute(f'SELECT 1 FROM {table} WHERE {id_column} = ?', (identifier,))
+        return cursor.fetchone() is not None
+
+    def already_scraped(self, rsid: str) -> bool:
+        """Check if a SNP has already been scraped."""
+        return self._already_exists('snps', 'rsid', rsid)
+
+    def genotype_already_scraped(self, genotype_id: str) -> bool:
+        """Check if a genotype has already been scraped."""
+        return self._already_exists('genotypes', 'id', genotype_id)
+
+    def save_progress(self, key: str, value: str):
+        """Save progress to the database."""
+        with self.db_pool.transaction() as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO progress (key, value) VALUES (?, ?)',
+                (key, str(value))
+            )
+
+    def get_progress(self, key: str) -> Optional[str]:
+        """Get progress value from the database."""
+        conn = self.db_pool.get_connection()
         cursor = conn.execute('SELECT value FROM progress WHERE key = ?', (key,))
         row = cursor.fetchone()
-        conn.close()
         return row[0] if row else None
 
 
