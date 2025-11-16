@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(sqlite3:*)"
+      "Bash(sqlite3:*)",
+      "WebFetch(domain:bots.snpedia.com)",
+      "Bash(python -m py_compile:*)"
     ],
     "deny": [],
     "ask": []

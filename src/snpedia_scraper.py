@@ -54,6 +54,7 @@ class SNPediaScraper:
         self.api_url = "https://bots.snpedia.com/api.php"
         self.total_snps = 110000  # From README
         self.total_genos = 104887  # From https://bots.snpedia.com/index.php/Category:Is_a_genotype
+        self.total_genosets = 283  # From https://bots.snpedia.com/index.php/Category:Is_a_genoset
 
         # Database connection pool
         self.db_pool = DatabaseConnectionPool(db_path)
@@ -99,7 +100,7 @@ class SNPediaScraper:
         if '(' in genotype_id and ')' in genotype_id:
             snp_id, genotype_with_paren = genotype_id.split('(', 1)
             genotype = genotype_with_paren.rstrip(')')
-            return snp_id, genotype
+            return snp_id.lower(), genotype.lower()
         else:
             # Fallback if format is unexpected
             return genotype_id, ''
@@ -119,6 +120,13 @@ class SNPediaScraper:
                     id TEXT PRIMARY KEY,
                     snp_id TEXT,
                     genotype TEXT,
+                    content TEXT,
+                    scraped_at TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS genosets (
+                    id TEXT PRIMARY KEY,
                     content TEXT,
                     scraped_at TIMESTAMP
                 )
@@ -187,11 +195,17 @@ class SNPediaScraper:
         count = int(self.get_progress('genotype_count') or 0)
         return count, self.total_genos
 
+    def get_genoset_progress(self) -> Tuple[int, int]:
+        """Get current progress for genosets."""
+        count = int(self.get_progress('genoset_count') or 0)
+        return count, self.total_genosets
+
     def get_combined_progress(self) -> Tuple[int, int]:
-        """Get combined progress for SNPs and genotypes."""
+        """Get combined progress for SNPs, genotypes, and genosets."""
         snp_count = int(self.get_progress('snp_count') or 0)
         genotype_count = int(self.get_progress('genotype_count') or 0)
-        return snp_count + genotype_count, self.total_snps + self.total_genos
+        genoset_count = int(self.get_progress('genoset_count') or 0)
+        return snp_count + genotype_count + genoset_count, self.total_snps + self.total_genos + self.total_genosets
 
     def _fetch_batch_content(self, page_titles: list) -> dict:
         """
@@ -258,7 +272,7 @@ class SNPediaScraper:
                 rows = []
                 for identifier, content in entries:
                     snp_id, genotype = self._parse_genotype_id(identifier)
-                    rows.append((identifier, snp_id, genotype, content, timestamp))
+                    rows.append((identifier.lower(), snp_id.lower(), genotype.lower(), content, timestamp))
 
                 conn.executemany(
                     f'INSERT INTO {table} ({id_column}, snp_id, genotype, content, scraped_at) VALUES (?, ?, ?, ?, ?)',
@@ -268,7 +282,7 @@ class SNPediaScraper:
                 # For other tables (like snps), use the original format
                 conn.executemany(
                     f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
-                    [(identifier, content, timestamp) for identifier, content in entries]
+                    [(identifier.lower(), content, timestamp) for identifier, content in entries]
                 )
 
     def _scrape_category(
@@ -325,7 +339,7 @@ class SNPediaScraper:
                 # Collect all page titles from this batch
                 all_identifiers = []
                 for page in data['query']['categorymembers']:
-                    identifier = page['title'].replace(' ', '_')
+                    identifier = page['title'].replace(' ', '_').lower()
                     all_identifiers.append(identifier)
 
                 # Batch check which items already exist
@@ -426,9 +440,9 @@ class SNPediaScraper:
         return count
 
     def _scrape_loop(self):
-        """Main scraping loop that handles both SNPs and genotypes."""
+        """Main scraping loop that handles SNPs, genotypes, and genosets."""
         try:
-            # Scrape SNPs
+            # Scrape genotypes first
             if self.log_callback:
                 self.log_callback("Starting genotype scraping...")
 
@@ -442,6 +456,21 @@ class SNPediaScraper:
                 item_name='genotype'
             )
 
+            # Scrape genosets
+            if self.log_callback:
+                self.log_callback("Starting genoset scraping...")
+
+            self._scrape_category(
+                category='Category:Is_a_genoset',
+                table='genosets',
+                id_column='id',
+                count_key='genoset_count',
+                continue_key='cmcontinue_genoset',
+                total_count=self.total_genosets,
+                item_name='genoset'
+            )
+
+            # Scrape SNPs
             if self.log_callback:
                 self.log_callback("Starting SNP scraping...")
 
@@ -487,7 +516,7 @@ class SNPediaScraper:
         placeholders = ','.join('?' * len(identifiers))
         query = f'SELECT {id_column} FROM {table} WHERE {id_column} IN ({placeholders})'
 
-        cursor = conn.execute(query, identifiers)
+        cursor = conn.execute(query, [i.lower() for i in identifiers])
         existing = {row[0] for row in cursor.fetchall()}
 
         return existing
@@ -499,6 +528,10 @@ class SNPediaScraper:
     def genotype_already_scraped(self, genotype_id: str) -> bool:
         """Check if a genotype has already been scraped."""
         return self._already_exists('genotypes', 'id', genotype_id)
+
+    def genoset_already_scraped(self, genoset_id: str) -> bool:
+        """Check if a genoset has already been scraped."""
+        return self._already_exists('genosets', 'id', genoset_id)
 
     def save_progress(self, key: str, value: str):
         """Save progress to the database."""

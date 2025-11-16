@@ -123,8 +123,13 @@ This will:
 - `content` (TEXT): Raw wiki content
 - `scraped_at` (TIMESTAMP): When the genotype was scraped
 
+### `genosets` table
+- `id` (TEXT PRIMARY KEY): Genoset identifier (e.g., "Gs100")
+- `content` (TEXT): Raw wiki content
+- `scraped_at` (TIMESTAMP): When the genoset was scraped
+
 ### `progress` table
-- `key` (TEXT PRIMARY KEY): Progress key (cmcontinue, snp_count)
+- `key` (TEXT PRIMARY KEY): Progress key (cmcontinue, snp_count, genotype_count, genoset_count)
 - `value` (TEXT): Progress value for resumption
 
 ## File Structure
@@ -167,6 +172,7 @@ SNPedia-Scraper/
 ### Expected Data
 - ~110,000 total SNPs in SNPedia
 - ~105,000 total genotypes in SNPedia
+- ~283 total genosets in SNPedia
 - Average content size: ~1KB per entry
 - Small entries (<100 chars): Mostly 23andMe mappings
 - Genotypes are split into `snp_id` and `genotype` for easy querying
