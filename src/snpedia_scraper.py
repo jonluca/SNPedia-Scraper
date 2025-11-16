@@ -141,6 +141,12 @@ class SNPediaScraper:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+            # Create index on snp_id column if it doesn't exist
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_genotypes_snp_id
+                ON genotypes(snp_id)
+            ''')
+
     def start(self):
         if not self.running:
             self.running = True
@@ -159,8 +165,17 @@ class SNPediaScraper:
 
     def stop(self):
         self.running = False
-        self.db_pool.close()
         if self.log_callback: self.log_callback("Scraper stopping...")
+        if self.log_callback: self.log_callback("Optimizing database (VACUUM)...")
+        try:
+            conn = self.db_pool.get_connection()
+            conn.execute("VACUUM")
+            conn.commit()
+            if self.log_callback: self.log_callback("Database optimization complete.")
+        except Exception as e:
+            if self.log_callback: self.log_callback(f"VACUUM warning: {e}")
+        finally:
+            self.db_pool.close()
 
     def get_current_progress(self) -> Tuple[int, int]:
         """Get current progress for SNPs."""
@@ -255,10 +270,6 @@ class SNPediaScraper:
                     f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
                     [(identifier, content, timestamp) for identifier, content in entries]
                 )
-
-    def _save_entry(self, table: str, id_column: str, identifier: str, content: str):
-        """Save a single entry to the database."""
-        self._save_entries(table, id_column, [(identifier, content)])
 
     def _scrape_category(
         self,
