@@ -86,6 +86,24 @@ class SNPediaScraper:
             f.write(f"{timestamp} | {rsid} | {error_type} | {error_message}\n")
             f.flush()  # Ensure it's written immediately
 
+    def _parse_genotype_id(self, genotype_id: str) -> Tuple[str, str]:
+        """
+        Parse a genotype ID into snp_id and genotype components.
+
+        Args:
+            genotype_id: The full genotype ID (e.g., "i3000043(g;g)")
+
+        Returns:
+            Tuple of (snp_id, genotype) - e.g., ("i3000043", "g;g")
+        """
+        if '(' in genotype_id and ')' in genotype_id:
+            snp_id, genotype_with_paren = genotype_id.split('(', 1)
+            genotype = genotype_with_paren.rstrip(')')
+            return snp_id, genotype
+        else:
+            # Fallback if format is unexpected
+            return genotype_id, ''
+
     def _create_tables(self):
         """Create database tables if they don't exist."""
         with self.db_pool.transaction() as conn:
@@ -99,6 +117,8 @@ class SNPediaScraper:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS genotypes (
                     id TEXT PRIMARY KEY,
+                    snp_id TEXT,
+                    genotype TEXT,
                     content TEXT,
                     scraped_at TIMESTAMP
                 )
@@ -109,6 +129,17 @@ class SNPediaScraper:
                     value TEXT
                 )
             ''')
+
+            # Add columns to existing table if they don't exist
+            try:
+                conn.execute('ALTER TABLE genotypes ADD COLUMN snp_id TEXT')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            try:
+                conn.execute('ALTER TABLE genotypes ADD COLUMN genotype TEXT')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     def start(self):
         if not self.running:
@@ -207,10 +238,23 @@ class SNPediaScraper:
 
         timestamp = datetime.now()
         with self.db_pool.transaction() as conn:
-            conn.executemany(
-                f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
-                [(identifier, content, timestamp) for identifier, content in entries]
-            )
+            if table == 'genotypes':
+                # For genotypes, parse the ID and populate snp_id and genotype columns
+                rows = []
+                for identifier, content in entries:
+                    snp_id, genotype = self._parse_genotype_id(identifier)
+                    rows.append((identifier, snp_id, genotype, content, timestamp))
+
+                conn.executemany(
+                    f'INSERT INTO {table} ({id_column}, snp_id, genotype, content, scraped_at) VALUES (?, ?, ?, ?, ?)',
+                    rows
+                )
+            else:
+                # For other tables (like snps), use the original format
+                conn.executemany(
+                    f'INSERT INTO {table} ({id_column}, content, scraped_at) VALUES (?, ?, ?)',
+                    [(identifier, content, timestamp) for identifier, content in entries]
+                )
 
     def _save_entry(self, table: str, id_column: str, identifier: str, content: str):
         """Save a single entry to the database."""

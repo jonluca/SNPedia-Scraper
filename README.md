@@ -117,9 +117,11 @@ This will:
 - `scraped_at` (TIMESTAMP): When the SNP was scraped
 
 ### `genotypes` table
-- `id` (TEXT PRIMARY KEY): Genotype ID
+- `id` (TEXT PRIMARY KEY): Full genotype ID (e.g., "i3000043(g;g)")
+- `snp_id` (TEXT): SNP identifier extracted from ID (e.g., "i3000043")
+- `genotype` (TEXT): Genotype value extracted from ID (e.g., "g;g")
 - `content` (TEXT): Raw wiki content
-- `scraped_at` (TIMESTAMP): When the SNP was scraped
+- `scraped_at` (TIMESTAMP): When the genotype was scraped
 
 ### `progress` table
 - `key` (TEXT PRIMARY KEY): Progress key (cmcontinue, snp_count)
@@ -134,6 +136,7 @@ SNPedia-Scraper/
 ├── dashboard.py               # Web dashboard with backup manager
 ├── index.html                 # Dashboard frontend
 ├── error_recover.py           # Error recovery tool
+├── migrate_genotypes.py       # Migration script for genotype data
 ├── requirements.txt           # Python dependencies
 ├── snpedia.db                # SQLite database (created on first run)
 ├── backup_config.json         # Backup settings (created by dashboard)
@@ -163,9 +166,10 @@ SNPedia-Scraper/
 
 ### Expected Data
 - ~110,000 total SNPs in SNPedia
-- ~105,000 total SNPs in SNPedia
-- Average content size: ~1KB per SNP
+- ~105,000 total genotypes in SNPedia
+- Average content size: ~1KB per entry
 - Small entries (<100 chars): Mostly 23andMe mappings
+- Genotypes are split into `snp_id` and `genotype` for easy querying
 
 ## Troubleshooting
 
